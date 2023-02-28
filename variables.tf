@@ -15,7 +15,7 @@ variable "aws_region" {
 
 variable "azure_region" {
   type = string
-  default = "East US"
+  default = "West Europe"
 }
 
 variable "ssh_key" {
@@ -43,7 +43,22 @@ variable "avx_ctrl_account_aws" {
   type = string
 }
 
+#========================= spoke 1
+variable "gw_subnet_spoke1" {
+  default = "192.168.1.0/24"
+}
 
+variable "vnet_cidr_spoke1" {
+  default = "10.101.0.0/16"
+}
 
+#========================= spoke 2
+variable "gw_subnet_spoke2" {
+  default = "192.168.2.0/24"
+}
+
+variable "vnet_cidr_spoke2" {
+  default = "10.102.0.0/16"
+}
 
 

@@ -2,15 +2,15 @@ terraform {
   cloud {
     organization = "CONIX"
 
-    workspaces {
-      name = "BLOG-10-UserVPNandMicrosegmentation"
+   workspaces {
+      name = "DFW"
     }
   }
   required_providers {
 
     aviatrix = {
       source  = "aviatrixsystems/aviatrix"
-      version = "~>2.23.2"
+      version = "~>3.0.1"
     }
     aws = {
       source = "hashicorp/aws"

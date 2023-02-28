@@ -1,87 +1,241 @@
 # # #---------------------------------------------------------- Transit ----------------------------------------------------------
-module "mc_transit" {
-  source                        = "terraform-aviatrix-modules/mc-transit/aviatrix"
-  version                       = "v2.2.1"
-  cloud                         = "AWS"
-  name                          = "${local.env_prefix}-AZ-trans-1"
-  region                        = var.aws_region
-  cidr                          = "10.200.0.0/23"
-  account                       = var.avx_ctrl_account_aws
-  ha_gw                         = true
-  local_as_number               = "65100"
-  enable_transit_firenet        = true
-  enable_advertise_transit_cidr = true
-  tags = {
-    Owner = "pkonitz"
-    Blog  = "post10"
+
+module "azure_transit" {
+  source  = "terraform-aviatrix-modules/mc-transit/aviatrix"
+  version = "2.4.1"
+  name    = "${local.env_prefix}-AZ-trans-1"
+  cloud   = "azure"
+  region  = var.azure_region
+  cidr    = "10.1.0.0/23"
+  account = var.avx_ctrl_account_azure
+}
+
+
+
+
+#================================== spoke 1 =====================================
+resource "azurerm_resource_group" "this" {
+  name     = "RG-spoke1"
+  location = var.azure_region
+}
+
+resource "azurerm_route_table" "this" {
+  for_each            = toset(["gateway", "internal1", "internal2", "public1", "public2"])
+  name                = "spoke1-${each.value}"
+  location            = var.azure_region
+  resource_group_name = azurerm_resource_group.this.name
+
+  #Only add blackhole routes for Internal route tables
+  dynamic "route" {
+    for_each = can(regex("internal", each.value)) ? ["dummy"] : [] #Trick to make block conditional. Count not available on dynamic blocks.
+    content {
+      name           = "Blackhole"
+      address_prefix = "0.0.0.0/0"
+      next_hop_type  = "None"
+    }
+  }
+
+  lifecycle {
+    ignore_changes = [route, ] #Since the Aviatrix controller will maintain the routes, we want to ignore any changes to them in Terraform.
   }
 }
 
 
-module "mc-spoke1" {
-  source     = "terraform-aviatrix-modules/mc-spoke/aviatrix"
-  version    = "1.3.1"
-  cloud      = "AWS"
-  name       = "${local.env_prefix}-AWS-spoke-1"
-  region     = var.aws_region
-  cidr       = "10.201.0.0/23"
-  account    = var.avx_ctrl_account_aws
-  ha_gw         = false
-  transit_gw = module.mc_transit.transit_gateway.gw_name
+module "vnet" {
+  source              = "Azure/vnet/azurerm"
+  vnet_name           = "${local.env_prefix}-vnet1"
+  vnet_location       = var.azure_region
+  use_for_each = true
+  resource_group_name = azurerm_resource_group.this.name
+  address_space       = [var.gw_subnet_spoke1, var.vnet_cidr_spoke1] #Use a separate CIDR for gateways, to optimize usable IP space for workloads.
+  subnet_prefixes = [
+    var.gw_subnet_spoke1,
+    cidrsubnet(var.vnet_cidr_spoke1, 3, 0),
+    cidrsubnet(var.vnet_cidr_spoke1, 3, 1),
+    cidrsubnet(var.vnet_cidr_spoke1, 3, 2),
+    cidrsubnet(var.vnet_cidr_spoke1, 3, 3),
+    cidrsubnet(var.vnet_cidr_spoke1, 3, 4),
+    cidrsubnet(var.vnet_cidr_spoke1, 3, 5),
+    cidrsubnet(var.vnet_cidr_spoke1, 3, 6),
+    cidrsubnet(var.vnet_cidr_spoke1, 3, 7)
+  ]
+  subnet_names = [
+    "AviatrixGateway",
+    "Internal1",
+    "Internal2",
+    "Internal3",
+    "Internal4",
+    "External1",
+    "External2",
+    "External3",
+    "External4",
+  ]
+
+  route_tables_ids = {
+    AviatrixGateway = azurerm_route_table.this["gateway"].id
+    Internal1       = azurerm_route_table.this["internal1"].id
+    Internal2       = azurerm_route_table.this["internal2"].id
+    Internal3       = azurerm_route_table.this["internal1"].id
+    Internal4       = azurerm_route_table.this["internal2"].id
+    External1       = azurerm_route_table.this["public1"].id
+    External2       = azurerm_route_table.this["public2"].id
+    External3       = azurerm_route_table.this["public1"].id
+    External4       = azurerm_route_table.this["public2"].id
+  }
+
+  depends_on = [
+    azurerm_resource_group.this
+  ]
 }
 
-# module "mc-spoke2" {
-#   source     = "terraform-aviatrix-modules/mc-spoke/aviatrix"
-#   version    = "1.3.1"
-#   cloud      = "AWS"
-#   name       = "${local.env_prefix}-AWS-spoke-2"
-#   region     = var.aws_region
-#   cidr       = "10.202.0.0/23"
-#   account    = var.avx_ctrl_account_aws
-#   ha_gw      = false
-#   transit_gw = module.mc_transit.transit_gateway.gw_name
-# }
+module "spoke1_azure" {
+  source  = "terraform-aviatrix-modules/mc-spoke/aviatrix"
+  version = "1.5.0"
 
-# module "mc-spoke3" {
-#   source     = "terraform-aviatrix-modules/mc-spoke/aviatrix"
-#   version    = "1.3.1"
-#   cloud      = "AWS"
-#   name       = "${local.env_prefix}-AWS-vpn-spoke"
-#   region     = "eu-west-1"
-#   cidr       = "10.203.0.0/23"
-#   account    = var.avx_ctrl_account_aws
-#   ha_gw      = false
-#   transit_gw = module.mc_transit.transit_gateway.gw_name
-# }
+  cloud            = "Azure"
+  name             = "${local.env_prefix}-spoke1"
+  region           = var.azure_region
+  account          = var.avx_ctrl_account_azure
+  transit_gw       = module.azure_transit.transit_gateway.gw_name
+  use_existing_vpc = true
+  vpc_id           = format("%s:%s", module.vnet.vnet_name, azurerm_resource_group.this.name)
+  gw_subnet        = var.gw_subnet_spoke1
+  ha_gw            = false
+  # hagw_subnet      = var.gw_subnet #Can be the same subnet, as in Azure subnets stretch AZ's.
 
-# # Create an Aviatrix AWS Gateway with VPN enabled
-# resource "aviatrix_gateway" "test_vpn_gateway_aws" {
-#   cloud_type   = 1
-#   account_name = var.avx_ctrl_account_aws
-#   gw_name      = "vpn-gw-1"
-#   vpc_id       = module.mc-spoke3.vpc.vpc_id
-#   vpc_reg      = "eu-west-1"
-#   gw_size      = "t2.micro"
-#   subnet       = module.mc-spoke3.vpc.public_subnets[0].cidr
-#   vpn_access   = true
-#   vpn_cidr     = "192.168.43.0/24"
-#   max_vpn_conn = "100"
-#   enable_elb   = true
-# }
+  depends_on = [
+    module.azure_transit,
+    module.vnet
+  ]
+}
+
+#================================== spoke 2 =====================================
+resource "azurerm_resource_group" "RG_spoke2" {
+  name     = "RG-spoke2"
+  location = var.azure_region
+}
+
+resource "azurerm_route_table" "RT_spoke2" {
+  for_each            = toset(["gateway", "internal1", "internal2", "public1", "public2"])
+  name                = "spoke2-${each.value}"
+  location            = var.azure_region
+  resource_group_name = azurerm_resource_group.RG_spoke2.name
+
+  #Only add blackhole routes for Internal route tables
+  dynamic "route" {
+    for_each = can(regex("internal", each.value)) ? ["dummy"] : [] #Trick to make block conditional. Count not available on dynamic blocks.
+    content {
+      name           = "Blackhole"
+      address_prefix = "0.0.0.0/0"
+      next_hop_type  = "None"
+    }
+  }
+
+  lifecycle {
+    ignore_changes = [route, ] #Since the Aviatrix controller will maintain the routes, we want to ignore any changes to them in Terraform.
+  }
+}
 
 
-# # Create an Aviatrix AWS VPN User Profile
-# resource "aviatrix_vpn_profile" "vpn_profile_1" {
-#   name      = "DB_access"
-#   base_rule = "allow_all"
-# }
+module "vnet2" {
+  source              = "Azure/vnet/azurerm"
+  vnet_name           = "${local.env_prefix}-vnet2"
+  vnet_location       = var.azure_region
+  use_for_each = true
+  resource_group_name = azurerm_resource_group.RG_spoke2.name
+  address_space       = [var.gw_subnet_spoke2, var.vnet_cidr_spoke2] #Use a separate CIDR for gateways, to optimize usable IP space for workloads.
+  subnet_prefixes = [
+    var.gw_subnet_spoke2,
+    cidrsubnet(var.vnet_cidr_spoke2, 3, 0),
+    cidrsubnet(var.vnet_cidr_spoke2, 3, 1),
+    cidrsubnet(var.vnet_cidr_spoke2, 3, 2),
+    cidrsubnet(var.vnet_cidr_spoke2, 3, 3),
+    cidrsubnet(var.vnet_cidr_spoke2, 3, 4),
+    cidrsubnet(var.vnet_cidr_spoke2, 3, 5),
+    cidrsubnet(var.vnet_cidr_spoke2, 3, 6),
+    cidrsubnet(var.vnet_cidr_spoke2, 3, 7)
+  ]
+  subnet_names = [
+    "AviatrixGateway",
+    "Internal1",
+    "Internal2",
+    "Internal3",
+    "Internal4",
+    "External1",
+    "External2",
+    "External3",
+    "External4",
+  ]
 
-# # Create an Aviatrix VPN User
-# resource "aviatrix_vpn_user" "test_vpn_user" {
-#   vpc_id     = module.mc-spoke3.vpc.vpc_id
-#   gw_name    = aviatrix_gateway.test_vpn_gateway_aws.gw_name
-#   user_name  = "username1"
-#   user_email = "pkonitz@aviatrix.com"
-#   manage_user_attachment = true
-#   profiles = [aviatrix_vpn_profile.vpn_profile_1.name]
+  route_tables_ids = {
+    AviatrixGateway = azurerm_route_table.RT_spoke2["gateway"].id
+    Internal1       = azurerm_route_table.RT_spoke2["internal1"].id
+    Internal2       = azurerm_route_table.RT_spoke2["internal2"].id
+    Internal3       = azurerm_route_table.RT_spoke2["internal1"].id
+    Internal4       = azurerm_route_table.RT_spoke2["internal2"].id
+    External1       = azurerm_route_table.RT_spoke2["public1"].id
+    External2       = azurerm_route_table.RT_spoke2["public2"].id
+    External3       = azurerm_route_table.RT_spoke2["public1"].id
+    External4       = azurerm_route_table.RT_spoke2["public2"].id
+  }
+
+  depends_on = [
+    azurerm_resource_group.RG_spoke2
+  ]
+}
+
+module "spoke2_azure" {
+  source  = "terraform-aviatrix-modules/mc-spoke/aviatrix"
+  version = "1.5.0"
+
+  cloud            = "Azure"
+  name             = "${local.env_prefix}-spoke2"
+  region           = var.azure_region
+  account          = var.avx_ctrl_account_azure
+  transit_gw       = module.azure_transit.transit_gateway.gw_name
+  use_existing_vpc = true
+  vpc_id           = format("%s:%s", module.vnet2.vnet_name, azurerm_resource_group.RG_spoke2.name)
+  gw_subnet        = var.gw_subnet_spoke2
+  ha_gw            = false
+  # hagw_subnet      = var.gw_subnet #Can be the same subnet, as in Azure subnets stretch AZ's.
+
+  depends_on = [
+    module.azure_transit,
+    module.vnet2
+  ]
+}
+
+# 1 - enable DFW
+resource "aviatrix_distributed_firewalling_config" "test" {
+  enable_distributed_firewalling = true
+}
+
+
+# # 2 - enable intra vpc DFW per vnet
+resource "aviatrix_distributed_firewalling_intra_vpc" "test" {
+# vpc_id
+# "vpc_id": "VNet_name:RG_name:resourceGuid"
+  
+  vpcs {
+    account_name = var.avx_ctrl_account_azure
+    vpc_id       = module.spoke1_azure.vpc.vpc_id
+    region       = var.azure_region
+  }
+}
+  vpcs {
+    account_name = var.avx_ctrl_account_azure
+    vpc_id       = module.spoke2_azure.vpc.vpc_id
+    region       = var.azure_region
+  }
+}
+#   vpcs {
+#     account_name = var.avx_ctrl_account_azure
+#     vpc_id       = "${module.vnet2.vnet.name}:${module.vnet2.azurerm_virtual_network.vnet.resource_group_name}:${module.vnet2.azurerm_virtual_network.vnet.guid}"
+#     region       = var.azure_region
+#   }
+
+#   depends_on = [
+#     module.vnet,
+#     module.vnet2
+#   ]
 # }
