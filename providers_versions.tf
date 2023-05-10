@@ -10,7 +10,7 @@ terraform {
 
     aviatrix = {
       source  = "aviatrixsystems/aviatrix"
-      version = "~>3.0.1"
+      version = "~>3.0.5"
     }
     aws = {
       source = "hashicorp/aws"
